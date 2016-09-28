@@ -118,6 +118,26 @@ module Fluent
       TIME_PARAMETERS.each do |name, type, opts|
         config_param name, type, opts
       end
+
+      def configure(conf)
+        if conf.has_key?('localtime') || conf.has_key?('utc')
+          if conf.has_key?('localtime') && conf.has_key?('utc')
+            raise Fluent::ConfigError, "both of utc and localtime are specified, use only one of them"
+          elsif conf.has_key?('localtime')
+            conf['localtime'] = Fluent::Config.bool_value(conf['localtime'])
+          elsif conf.has_key?('utc')
+            conf['localtime'] = !(Fluent::Config.bool_value(conf['utc']))
+            # Specifying "localtime false" means using UTC in TimeFormatter
+            # And specifying "utc" is different from specifying "timezone +0000"(it's not always UTC).
+            # There are difference between "Z" and "+0000" in timezone formatting.
+            # TODO: add kwargs to TimeFormatter to specify "using localtime", "using UTC" or "using specified timezone" in more explicit way
+          end
+        end
+
+        super
+
+        Fluent::Timezone.validate!(@timezone) if @timezone
+      end
     end
 
     module Parser
