@@ -16,41 +16,52 @@
 
 require 'fileutils'
 require 'zlib'
+require 'time'
 
-require 'fluent/output'
+require 'fluent/plugin/output'
 require 'fluent/config/error'
-require 'fluent/system_config'
+# TODO remove ...
+require 'fluent/plugin/file_util'
 
-module Fluent
-  class FileOutput < TimeSlicedOutput
-    include SystemConfig::Mixin
+module Fluent::Plugin
+  class FileOutput < Output
+    Fluent::Plugin.register_output('file', self)
 
-    Plugin.register_output('file', self)
+    helpers :formatter, :inject, :compat_parameters
 
-    SUPPORTED_COMPRESS = {
-      'gz' => :gz,
-      'gzip' => :gz,
+    SUPPORTED_COMPRESS = [:text, :gz, :gzip]
+    SUPPORTED_COMPRESS_MAP = {
+      text: nil,
+      gz: :gzip,
+      gzip: :gzip,
     }
 
     FILE_PERMISSION = 0644
     DIR_PERMISSION = 0755
 
+    DEFAULT_TIMEKEY = 60 * 60 * 24
+
     desc "The Path of the file."
     config_param :path, :string
-    desc "The format of the file content. The default is out_file."
-    config_param :format, :string, default: 'out_file', skip_accessor: true
+
     desc "The flushed chunk is appended to existence file or not."
     config_param :append, :bool, default: false
     desc "Compress flushed file."
-    config_param :compress, default: nil do |val|
-      c = SUPPORTED_COMPRESS[val]
-      unless c
-        raise ConfigError, "Unsupported compression algorithm '#{val}'"
-      end
-      c
-    end
+    config_param :compress, :enum, list: SUPPORTED_COMPRESS, default: :text
+    desc "Execute compression again even when buffer chunk is already compressed."
+    config_param :recompress, :bool, default: false
     desc "Create symlink to temporary buffered file when buffer_type is file."
     config_param :symlink_path, :string, default: nil
+
+    config_section :format, init: true do
+      config_set_default :@type, 'out_file'
+    end
+
+    config_section :buffer do
+      config_set_default :@type, 'file'
+      config_set_default :chunk_keys, ['time']
+      config_set_default :timekey, DEFAULT_TIMEKEY
+    end
 
     module SymlinkBufferMixin
       def symlink_path=(path)
@@ -71,40 +82,34 @@ module Fluent
       end
     end
 
-    def initialize
-      require 'zlib'
-      require 'time'
-      require 'fluent/plugin/file_util'
-      super
-    end
-
     def configure(conf)
-      if path = conf['path']
-        @path = path
-      end
-      unless @path
-        raise ConfigError, "'path' parameter is required on file output"
-      end
+      compat_parameters_convert(conf, :formatter, :buffer, :inject, default_chunk_key: "time")
 
-      if pos = @path.index('*')
-        @path_prefix = @path[0,pos]
-        @path_suffix = @path[pos+1..-1]
-        conf['buffer_path'] ||= "#{@path}"
-      else
-        @path_prefix = @path+"."
-        @path_suffix = ".log"
-        conf['buffer_path'] ||= "#{@path}.*"
+      # v0.14 file buffer handles path as directory if '*' is missing
+      # 'dummy_path' is not to raise configuration error for 'path' in file buffer plugin,
+      # but raise it in this plugin.
+      if conf.elements(name: 'buffer').empty?
+        conf.add_element('buffer', 'time')
       end
-
-      test_path = generate_path(Time.now.strftime(@time_slice_format))
-      unless ::Fluent::FileUtil.writable_p?(test_path)
-        raise ConfigError, "out_file: `#{test_path}` is not writable"
+      buffer_conf = conf.elements(name: 'buffer').first
+      unless buffer_conf.has_key?('path')
+        buffer_conf['path'] = conf['path'] || '/tmp/dummy_path'
       end
 
       super
 
-      @formatter = Plugin.new_formatter(@format)
-      @formatter.configure(conf)
+      @compress_method = SUPPORTED_COMPRESS_MAP[@compress]
+
+      @path_template = generate_path_template(@path, @buffer_config.timekey, @append, @compress_method)
+      # TODO: consider placeholders, like ${tag[0]} or ${unknown_field}
+      #       add output api to list placeholders in template
+      test_metadata = metadata('test.tag', Fluent::Engine.now, {'message' => 'dummy record'})
+      test_path = extract_placeholders(@path_template, test_metadata)
+      unless ::Fluent::FileUtil.writable_p?(test_path)
+        raise Fluent::ConfigError, "out_file: `#{test_path}` is not writable"
+      end
+
+      @formatter = formatter_create(conf: conf.elements('format').first)
 
       if @symlink_path && @buffer.respond_to?(:path)
         @buffer.extend SymlinkBufferMixin
@@ -116,56 +121,102 @@ module Fluent
     end
 
     def format(tag, time, record)
-      @formatter.format(tag, time, record)
+      r = inject_values_to_record(tag, time, record)
+      @formatter.format(tag, time, r)
     end
 
     def write(chunk)
-      path = generate_path(chunk.key)
+      path = extract_placeholders(@path_template, chunk.metadata)
       FileUtils.mkdir_p File.dirname(path), mode: @dir_perm
 
-      case @compress
-      when nil
-        File.open(path, "ab", @file_perm) {|f|
-          chunk.write_to(f)
-        }
-      when :gz
-        File.open(path, "ab", @file_perm) {|f|
-          gz = Zlib::GzipWriter.new(f)
-          chunk.write_to(gz)
-          gz.close
-        }
+      unless @append
+        path = find_filepath_available(path)
       end
 
-      return path  # for test
+      case @compress_method
+      when nil
+        File.open(path, "ab", @file_perm) do |f|
+          chunk.write_to(f)
+        end
+      when :gzip
+        if @buffer.compress != :gzip || @recompress
+          File.open(path, "ab", @file_perm) do |f|
+            gz = Zlib::GzipWriter.new(f)
+            chunk.write_to(gz, compressed: :text)
+            gz.close
+          end
+        else
+          File.open(path, "ab", @file_perm) do |f|
+            chunk.write_to(f, compressed: :gzip)
+          end
+        end
+      else
+        raise "BUG: unknown compression method #{@compress_method}"
+      end
     end
 
     def secondary_init(primary)
       # don't warn even if primary.class is not FileOutput
+      # TODO: recommend out_secondary_file
     end
 
-    private
-
-    def suffix
-      case @compress
-      when nil
-        ''
-      when :gz
-        ".gz"
+    def timekey_to_timeformat(timekey)
+      case timekey
+      when nil          then ''
+      when 0...60       then '%Y%m%d%H%M%S' # 60 exclusive
+      when 60...3600    then '%Y%m%d%H%M'
+      when 3600...86400 then '%Y%m%d%H'
+      else                   '%Y%m%d'
       end
     end
 
-    def generate_path(time_string)
-      if @append
-        "#{@path_prefix}#{time_string}#{@path_suffix}#{suffix}"
+    def compression_suffix(compress)
+      case compress
+      when :gzip then '.gz'
+      when nil then ''
       else
-        path = nil
-        i = 0
-        begin
-          path = "#{@path_prefix}#{time_string}_#{i}#{@path_suffix}#{suffix}"
-          i += 1
-        end while File.exist?(path)
-        path
+        raise ArgumentError, "unknown compression type #{compress}"
       end
+    end
+
+    # /path/to/dir/file.*      -> /path/to/dir/file.%Y%m%d
+    # /path/to/dir/file.*.data -> /path/to/dir/file.%Y%m%d.data
+    # /path/to/dir/file        -> /path/to/dir/file.%Y%m%d.log
+    #   %Y%m%d -> %Y%m%d_** (non append)
+    # + .gz (gzipped)
+    def generate_path_template(original, timekey, append, compress)
+      comp_suffix = compression_suffix(compress)
+      if original.index('*')
+        if append
+          original.gsub('*', timekey_to_timeformat(timekey)) + comp_suffix
+        else
+          original.gsub('*', timekey_to_timeformat(timekey) + '_**') + comp_suffix
+        end
+      else
+        if timekey
+          if append
+            "#{original}.#{timekey_to_timeformat(timekey)}.log#{comp_suffix}"
+          else
+            "#{original}.#{timekey_to_timeformat(timekey)}_**.log#{comp_suffix}"
+          end
+        else
+          if append
+            "#{original}.log#{comp_suffix}"
+          else
+            "#{original}_**.log#{comp_suffix}"
+          end
+        end
+      end
+    end
+
+    def find_filepath_available(path_with_placeholder) # for non-append
+      raise "BUG: index placeholder not found in path: #{path_with_placeholder}" unless path_with_placeholder.index('_**')
+      i = 0
+      while path = path_with_placeholder.sub('_**', "_#{i}")
+        break unless File.exist?(path)
+        i += 1
+      end
+      path
     end
   end
 end
